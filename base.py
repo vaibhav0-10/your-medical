@@ -1,164 +1,82 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
-from dataclasses import dataclass
-from typing import Optional
+import functools
+import os
+import site
+import sys
+import sysconfig
 
-from pip._vendor.packaging.specifiers import SpecifierSet
-from pip._vendor.packaging.utils import NormalizedName
-from pip._vendor.packaging.version import Version
+from pip._internal.exceptions import InstallationError
+from pip._internal.utils import appdirs
+from pip._internal.utils.virtualenv import running_under_virtualenv
 
-from pip._internal.models.link import Link, links_equivalent
-from pip._internal.req.req_install import InstallRequirement
-from pip._internal.utils.hashes import Hashes
+# Application Directories
+USER_CACHE_DIR = appdirs.user_cache_dir("pip")
 
-CandidateLookup = tuple[Optional["Candidate"], Optional[InstallRequirement]]
-
-
-def format_name(project: NormalizedName, extras: frozenset[NormalizedName]) -> str:
-    if not extras:
-        return project
-    extras_expr = ",".join(sorted(extras))
-    return f"{project}[{extras_expr}]"
+# FIXME doesn't account for venv linked to global site-packages
+site_packages: str = sysconfig.get_path("purelib")
 
 
-@dataclass(frozen=True)
-class Constraint:
-    specifier: SpecifierSet
-    hashes: Hashes
-    hash_options: dict[str, list[str]]
-    links: frozenset[Link]
+def get_major_minor_version() -> str:
+    """
+    Return the major-minor version of the current Python as a string, e.g.
+    "3.7" or "3.10".
+    """
+    return "{}.{}".format(*sys.version_info)
 
-    @classmethod
-    def empty(cls) -> Constraint:
-        return Constraint(SpecifierSet(), Hashes(), {}, frozenset())
 
-    @classmethod
-    def from_ireq(cls, ireq: InstallRequirement) -> Constraint:
-        links = frozenset([ireq.link]) if ireq.link else frozenset()
-        hash_options = {alg: list(v) for alg, v in ireq.hash_options.items()}
-        return Constraint(
-            ireq.specifier,
-            ireq.hashes(trust_internet=False),
-            hash_options,
-            links,
+def change_root(new_root: str, pathname: str) -> str:
+    """Return 'pathname' with 'new_root' prepended.
+
+    If 'pathname' is relative, this is equivalent to os.path.join(new_root, pathname).
+    Otherwise, it requires making 'pathname' relative and then joining the
+    two, which is tricky on DOS/Windows and Mac OS.
+
+    This is borrowed from Python's standard library's distutils module.
+    """
+    if os.name == "posix":
+        if not os.path.isabs(pathname):
+            return os.path.join(new_root, pathname)
+        else:
+            return os.path.join(new_root, pathname[1:])
+
+    elif os.name == "nt":
+        (drive, path) = os.path.splitdrive(pathname)
+        if path[0] == "\\":
+            path = path[1:]
+        return os.path.join(new_root, path)
+
+    else:
+        raise InstallationError(
+            f"Unknown platform: {os.name}\n"
+            "Can not change root path prefix on unknown platform."
         )
 
-    def __bool__(self) -> bool:
-        return bool(self.specifier) or bool(self.hashes) or bool(self.links)
 
-    def __and__(self, other: InstallRequirement) -> Constraint:
-        if not isinstance(other, InstallRequirement):
-            return NotImplemented
-        specifier = self.specifier & other.specifier
-        hashes = self.hashes & other.hashes(trust_internet=False)
-        if not self.hash_options:
-            hash_options = {alg: list(v) for alg, v in other.hash_options.items()}
-        elif not other.hash_options:
-            hash_options = {alg: list(v) for alg, v in self.hash_options.items()}
-        else:
-            hash_options = {
-                alg: [v for v in other.hash_options[alg] if v in self.hash_options[alg]]
-                for alg in self.hash_options.keys() & other.hash_options.keys()
-            }
-        links = self.links
-        if other.link:
-            links = links.union([other.link])
-        return Constraint(specifier, hashes, hash_options, links)
+def get_src_prefix() -> str:
+    if running_under_virtualenv():
+        src_prefix = os.path.join(sys.prefix, "src")
+    else:
+        # FIXME: keep src in cwd for now (it is not a temporary folder)
+        try:
+            src_prefix = os.path.join(os.getcwd(), "src")
+        except OSError:
+            # In case the current working directory has been renamed or deleted
+            sys.exit("The folder you are executing pip from can no longer be found.")
 
-    def is_satisfied_by(self, candidate: Candidate) -> bool:
-        # Reject if there are any mismatched URL constraints on this package.
-        if self.links and not all(_match_link(link, candidate) for link in self.links):
-            return False
-        # We can safely always allow prereleases here since PackageFinder
-        # already implements the prerelease logic, and would have filtered out
-        # prerelease candidates if the user does not expect them.
-        return self.specifier.contains(candidate.version, prereleases=True)
-
-    def format_for_error(self) -> str:
-        s = str(self.specifier)
-        if self.links:
-            s += f" (from {', '.join(str(link) for link in self.links)})"
-        return s
+    # under macOS + virtualenv sys.prefix is not properly resolved
+    # it is something like /path/to/python/bin/..
+    return os.path.abspath(src_prefix)
 
 
-class Requirement:
-    @property
-    def project_name(self) -> NormalizedName:
-        """The "project name" of a requirement.
-
-        This is different from ``name`` if this requirement contains extras,
-        in which case ``name`` would contain the ``[...]`` part, while this
-        refers to the name of the project.
-        """
-        raise NotImplementedError("Subclass should override")
-
-    @property
-    def name(self) -> str:
-        """The name identifying this requirement in the resolver.
-
-        This is different from ``project_name`` if this requirement contains
-        extras, where ``project_name`` would not contain the ``[...]`` part.
-        """
-        raise NotImplementedError("Subclass should override")
-
-    def is_satisfied_by(self, candidate: Candidate) -> bool:
-        return False
-
-    def get_candidate_lookup(self) -> CandidateLookup:
-        raise NotImplementedError("Subclass should override")
-
-    def format_for_error(self) -> str:
-        raise NotImplementedError("Subclass should override")
+try:
+    # Use getusersitepackages if this is present, as it ensures that the
+    # value is initialised properly.
+    user_site: str | None = site.getusersitepackages()
+except AttributeError:
+    user_site = site.USER_SITE
 
 
-def _match_link(link: Link, candidate: Candidate) -> bool:
-    if candidate.source_link:
-        return links_equivalent(link, candidate.source_link)
-    return False
-
-
-class Candidate:
-    @property
-    def project_name(self) -> NormalizedName:
-        """The "project name" of the candidate.
-
-        This is different from ``name`` if this candidate contains extras,
-        in which case ``name`` would contain the ``[...]`` part, while this
-        refers to the name of the project.
-        """
-        raise NotImplementedError("Override in subclass")
-
-    @property
-    def name(self) -> str:
-        """The name identifying this candidate in the resolver.
-
-        This is different from ``project_name`` if this candidate contains
-        extras, where ``project_name`` would not contain the ``[...]`` part.
-        """
-        raise NotImplementedError("Override in subclass")
-
-    @property
-    def version(self) -> Version:
-        raise NotImplementedError("Override in subclass")
-
-    @property
-    def is_installed(self) -> bool:
-        raise NotImplementedError("Override in subclass")
-
-    @property
-    def is_editable(self) -> bool:
-        raise NotImplementedError("Override in subclass")
-
-    @property
-    def source_link(self) -> Link | None:
-        raise NotImplementedError("Override in subclass")
-
-    def iter_dependencies(self, with_requires: bool) -> Iterable[Requirement | None]:
-        raise NotImplementedError("Override in subclass")
-
-    def get_install_requirement(self) -> InstallRequirement | None:
-        raise NotImplementedError("Override in subclass")
-
-    def format_for_error(self) -> str:
-        raise NotImplementedError("Subclass should override")
+@functools.cache
+def is_osx_framework() -> bool:
+    return bool(sysconfig.get_config_var("PYTHONFRAMEWORK"))

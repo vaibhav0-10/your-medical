@@ -1,1 +1,1 @@
-"""Contains purely network-related utilities."""
+"""Index interaction code"""
