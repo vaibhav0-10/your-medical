@@ -1,178 +1,157 @@
-#   __
-#  /__)  _  _     _   _ _/   _
-# / (   (- (/ (/ (- _)  /  _)
-#          /
-
 """
-Requests HTTP Library
-~~~~~~~~~~~~~~~~~~~~~
+    pygments.formatters
+    ~~~~~~~~~~~~~~~~~~~
 
-Requests is an HTTP library, written in Python, for human beings.
-Basic GET usage:
+    Pygments formatters.
 
-   >>> import requests
-   >>> r = requests.get('https://www.python.org')
-   >>> r.status_code
-   200
-   >>> b'Python is a programming language' in r.content
-   True
-
-... or POST:
-
-   >>> payload = dict(key1='value1', key2='value2')
-   >>> r = requests.post('https://httpbin.org/post', data=payload)
-   >>> print(r.text)
-   {
-     ...
-     "form": {
-       "key1": "value1",
-       "key2": "value2"
-     },
-     ...
-   }
-
-The other HTTP methods are supported - see `requests.api`. Full documentation
-is at <https://requests.readthedocs.io>.
-
-:copyright: (c) 2017 by Kenneth Reitz.
-:license: Apache 2.0, see LICENSE for more details.
+    :copyright: Copyright 2006-2025 by the Pygments team, see AUTHORS.
+    :license: BSD, see LICENSE for details.
 """
 
-import warnings
+import re
+import sys
+import types
+import fnmatch
+from os.path import basename
 
-from pip._vendor import urllib3
+from pip._vendor.pygments.formatters._mapping import FORMATTERS
+from pip._vendor.pygments.plugin import find_plugin_formatters
+from pip._vendor.pygments.util import ClassNotFound
 
-from .exceptions import RequestsDependencyWarning
+__all__ = ['get_formatter_by_name', 'get_formatter_for_filename',
+           'get_all_formatters', 'load_formatter_from_file'] + list(FORMATTERS)
 
-charset_normalizer_version = None
-chardet_version = None
-
-
-def check_compatibility(urllib3_version, chardet_version, charset_normalizer_version):
-    urllib3_version = urllib3_version.split(".")
-    assert urllib3_version != ["dev"]  # Verify urllib3 isn't installed from git.
-
-    # Sometimes, urllib3 only reports its version as 16.1.
-    if len(urllib3_version) == 2:
-        urllib3_version.append("0")
-
-    # Check urllib3 for compatibility.
-    major, minor, patch = urllib3_version  # noqa: F811
-    major, minor, patch = int(major), int(minor), int(patch)
-    # urllib3 >= 1.21.1
-    assert major >= 1
-    if major == 1:
-        assert minor >= 21
-
-    # Check charset_normalizer for compatibility.
-    if chardet_version:
-        major, minor, patch = chardet_version.split(".")[:3]
-        major, minor, patch = int(major), int(minor), int(patch)
-        # chardet_version >= 3.0.2, < 8.0.0
-        assert (3, 0, 2) <= (major, minor, patch) < (8, 0, 0)
-    elif charset_normalizer_version:
-        major, minor, patch = charset_normalizer_version.split(".")[:3]
-        major, minor, patch = int(major), int(minor), int(patch)
-        # charset_normalizer >= 2.0.0 < 4.0.0
-        assert (2, 0, 0) <= (major, minor, patch) < (4, 0, 0)
-    else:
-        # pip does not need or use character detection
-        pass
+_formatter_cache = {}  # classes by name
+_pattern_cache = {}
 
 
-def _check_cryptography(cryptography_version):
-    # cryptography < 1.3.4
+def _fn_matches(fn, glob):
+    """Return whether the supplied file name fn matches pattern filename."""
+    if glob not in _pattern_cache:
+        pattern = _pattern_cache[glob] = re.compile(fnmatch.translate(glob))
+        return pattern.match(fn)
+    return _pattern_cache[glob].match(fn)
+
+
+def _load_formatters(module_name):
+    """Load a formatter (and all others in the module too)."""
+    mod = __import__(module_name, None, None, ['__all__'])
+    for formatter_name in mod.__all__:
+        cls = getattr(mod, formatter_name)
+        _formatter_cache[cls.name] = cls
+
+
+def get_all_formatters():
+    """Return a generator for all formatter classes."""
+    # NB: this returns formatter classes, not info like get_all_lexers().
+    for info in FORMATTERS.values():
+        if info[1] not in _formatter_cache:
+            _load_formatters(info[0])
+        yield _formatter_cache[info[1]]
+    for _, formatter in find_plugin_formatters():
+        yield formatter
+
+
+def find_formatter_class(alias):
+    """Lookup a formatter by alias.
+
+    Returns None if not found.
+    """
+    for module_name, name, aliases, _, _ in FORMATTERS.values():
+        if alias in aliases:
+            if name not in _formatter_cache:
+                _load_formatters(module_name)
+            return _formatter_cache[name]
+    for _, cls in find_plugin_formatters():
+        if alias in cls.aliases:
+            return cls
+
+
+def get_formatter_by_name(_alias, **options):
+    """
+    Return an instance of a :class:`.Formatter` subclass that has `alias` in its
+    aliases list. The formatter is given the `options` at its instantiation.
+
+    Will raise :exc:`pygments.util.ClassNotFound` if no formatter with that
+    alias is found.
+    """
+    cls = find_formatter_class(_alias)
+    if cls is None:
+        raise ClassNotFound(f"no formatter found for name {_alias!r}")
+    return cls(**options)
+
+
+def load_formatter_from_file(filename, formattername="CustomFormatter", **options):
+    """
+    Return a `Formatter` subclass instance loaded from the provided file, relative
+    to the current directory.
+
+    The file is expected to contain a Formatter class named ``formattername``
+    (by default, CustomFormatter). Users should be very careful with the input, because
+    this method is equivalent to running ``eval()`` on the input file. The formatter is
+    given the `options` at its instantiation.
+
+    :exc:`pygments.util.ClassNotFound` is raised if there are any errors loading
+    the formatter.
+
+    .. versionadded:: 2.2
+    """
     try:
-        cryptography_version = list(map(int, cryptography_version.split(".")))
-    except ValueError:
-        return
+        # This empty dict will contain the namespace for the exec'd file
+        custom_namespace = {}
+        with open(filename, 'rb') as f:
+            exec(f.read(), custom_namespace)
+        # Retrieve the class `formattername` from that namespace
+        if formattername not in custom_namespace:
+            raise ClassNotFound(f'no valid {formattername} class found in {filename}')
+        formatter_class = custom_namespace[formattername]
+        # And finally instantiate it with the options
+        return formatter_class(**options)
+    except OSError as err:
+        raise ClassNotFound(f'cannot read {filename}: {err}')
+    except ClassNotFound:
+        raise
+    except Exception as err:
+        raise ClassNotFound(f'error when loading custom formatter: {err}')
 
-    if cryptography_version < [1, 3, 4]:
-        warning = (
-            f"Old version of cryptography ({cryptography_version}) may cause slowdown."
-        )
-        warnings.warn(warning, RequestsDependencyWarning)
+
+def get_formatter_for_filename(fn, **options):
+    """
+    Return a :class:`.Formatter` subclass instance that has a filename pattern
+    matching `fn`. The formatter is given the `options` at its instantiation.
+
+    Will raise :exc:`pygments.util.ClassNotFound` if no formatter for that filename
+    is found.
+    """
+    fn = basename(fn)
+    for modname, name, _, filenames, _ in FORMATTERS.values():
+        for filename in filenames:
+            if _fn_matches(fn, filename):
+                if name not in _formatter_cache:
+                    _load_formatters(modname)
+                return _formatter_cache[name](**options)
+    for _name, cls in find_plugin_formatters():
+        for filename in cls.filenames:
+            if _fn_matches(fn, filename):
+                return cls(**options)
+    raise ClassNotFound(f"no formatter found for file name {fn!r}")
 
 
-# Check imported dependencies for compatibility.
-try:
-    check_compatibility(
-        urllib3.__version__, chardet_version, charset_normalizer_version
-    )
-except (AssertionError, ValueError):
-    warnings.warn(
-        f"urllib3 ({urllib3.__version__}) or chardet "
-        f"({chardet_version})/charset_normalizer ({charset_normalizer_version}) "
-        "doesn't match a supported version!",
-        RequestsDependencyWarning,
-    )
+class _automodule(types.ModuleType):
+    """Automatically import formatters."""
 
-# Attempt to enable urllib3's fallback for SNI support
-# if the standard library doesn't support SNI or the
-# 'ssl' library isn't available.
-try:
-    # Note: This logic prevents upgrading cryptography on Windows, if imported
-    #       as part of pip.
-    from pip._internal.utils.compat import WINDOWS
-    if not WINDOWS:
-        raise ImportError("pip internals: don't import cryptography on Windows")
-    try:
-        import ssl
-    except ImportError:
-        ssl = None
+    def __getattr__(self, name):
+        info = FORMATTERS.get(name)
+        if info:
+            _load_formatters(info[0])
+            cls = _formatter_cache[info[1]]
+            setattr(self, name, cls)
+            return cls
+        raise AttributeError(name)
 
-    if not getattr(ssl, "HAS_SNI", False):
-        from pip._vendor.urllib3.contrib import pyopenssl
 
-        pyopenssl.inject_into_urllib3()
-
-        # Check cryptography version
-        from cryptography import __version__ as cryptography_version
-
-        _check_cryptography(cryptography_version)
-except ImportError:
-    pass
-
-# urllib3's DependencyWarnings should be silenced.
-from pip._vendor.urllib3.exceptions import DependencyWarning
-
-warnings.simplefilter("ignore", DependencyWarning)
-
-# Set default logging handler to avoid "No handler found" warnings.
-import logging
-from logging import NullHandler
-
-from . import packages, utils
-from .__version__ import (
-    __author__,
-    __author_email__,
-    __build__,
-    __cake__,
-    __copyright__,
-    __description__,
-    __license__,
-    __title__,
-    __url__,
-    __version__,
-)
-from .api import delete, get, head, options, patch, post, put, request
-from .exceptions import (
-    ConnectionError,
-    ConnectTimeout,
-    FileModeWarning,
-    HTTPError,
-    JSONDecodeError,
-    ReadTimeout,
-    RequestException,
-    Timeout,
-    TooManyRedirects,
-    URLRequired,
-)
-from .models import PreparedRequest, Request, Response
-from .sessions import Session, session
-from .status_codes import codes
-
-logging.getLogger(__name__).addHandler(NullHandler())
-
-# FileModeWarnings go off per the default.
-warnings.simplefilter("default", FileModeWarning, append=True)
+oldmod = sys.modules[__name__]
+newmod = _automodule(__name__)
+newmod.__dict__.update(oldmod.__dict__)
+sys.modules[__name__] = newmod
+del newmod.newmod, newmod.oldmod, newmod.sys, newmod.types
