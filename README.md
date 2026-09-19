@@ -1,2 +1,1 @@
-# your-medical
-your medical for your life
+Optional Java utility. Compile: javac -d out src/com/medicalstore/StockCalculator.java && java -cp out com.medicalstore.StockCalculator

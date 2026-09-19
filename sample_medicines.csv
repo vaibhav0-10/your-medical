@@ -1,0 +1,3 @@
+code,name,generic_name,manufacturer,category,form,mrp,purchase_price,selling_price,gst,min_stock
+MED001,Paracetamol 500mg,Paracetamol,ABC Pharma,Analgesic,Tablet,20,10,15,5,20
+MED002,Amoxicillin 500mg,Amoxicillin,HealthCare Labs,Antibiotic,Capsule,80,45,65,5,10
